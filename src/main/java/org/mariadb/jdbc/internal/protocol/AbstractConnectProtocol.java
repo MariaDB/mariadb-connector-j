@@ -81,6 +81,7 @@ import org.mariadb.jdbc.credential.CredentialPlugin;
 import org.mariadb.jdbc.internal.MariaDbServerCapabilities;
 import org.mariadb.jdbc.internal.com.read.Buffer;
 import org.mariadb.jdbc.internal.com.read.ErrorPacket;
+import org.mariadb.jdbc.internal.com.read.OkPacket;
 import org.mariadb.jdbc.internal.com.read.ReadInitialHandShakePacket;
 import org.mariadb.jdbc.internal.com.read.dao.Results;
 import org.mariadb.jdbc.internal.com.send.SendClosePacket;
@@ -97,10 +98,14 @@ import org.mariadb.jdbc.internal.io.output.PacketOutputStream;
 import org.mariadb.jdbc.internal.io.output.StandardPacketOutputStream;
 import org.mariadb.jdbc.internal.logging.Logger;
 import org.mariadb.jdbc.internal.logging.LoggerFactory;
+import org.mariadb.jdbc.internal.util.RedirectionInfo;
+import org.mariadb.jdbc.internal.util.RedirectionInfoCache;
 import org.mariadb.jdbc.internal.util.ServerPrepareStatementCache;
 import org.mariadb.jdbc.internal.util.Utils;
 import org.mariadb.jdbc.internal.util.constant.HaMode;
 import org.mariadb.jdbc.internal.util.constant.ParameterConstant;
+import org.mariadb.jdbc.internal.util.constant.RedirectionErrorMessage;
+import org.mariadb.jdbc.internal.util.constant.RedirectionOption;
 import org.mariadb.jdbc.internal.util.constant.ServerStatus;
 import org.mariadb.jdbc.internal.util.exceptions.ExceptionFactory;
 import org.mariadb.jdbc.internal.util.pool.GlobalStateInfo;
@@ -121,6 +126,11 @@ public abstract class AbstractConnectProtocol implements Protocol {
   protected static final String CHECK_GALERA_STATE_QUERY = "show status like 'wsrep_local_state'";
 
   private static final Logger logger = LoggerFactory.getLogger(AbstractConnectProtocol.class);
+
+  // use -1 for unlimited for now, may need add a new option like
+  // options.redirectionInfoCacheSize
+  protected static RedirectionInfoCache redirectionInfoCache = new RedirectionInfoCache(-1);
+
   protected final ReentrantLock lock;
   protected final UrlParser urlParser;
   protected final Options options;
@@ -154,6 +164,10 @@ public abstract class AbstractConnectProtocol implements Protocol {
   private int minorVersion;
   private int patchVersion;
   private TimeZone timeZone;
+  protected HostAddress redirectHost;
+  protected String redirectUser;
+  protected int redirectTTL;
+  protected boolean isUsingRedirectInfo;
 
   /**
    * Get a protocol instance.
@@ -184,6 +198,14 @@ public abstract class AbstractConnectProtocol implements Protocol {
             ? Collections.emptyList()
             : Arrays.asList(urlParser.getOptions().galeraAllowedState.split(","));
     this.traceCache = traceCache;
+
+    if (options.enableRedirect.equalsIgnoreCase(RedirectionOption.ON.toString())
+        || options.enableRedirect.equalsIgnoreCase(RedirectionOption.PREFERRED.toString())) {
+      isUsingRedirectInfo = false;
+      redirectHost = null;
+      redirectUser = null;
+      redirectTTL = 0;
+    }
   }
 
   private static void closeSocket(
@@ -505,15 +527,114 @@ public abstract class AbstractConnectProtocol implements Protocol {
 
   private void createConnection(HostAddress hostAddress, String username) throws SQLException {
 
+    // check cache first to see if the redirect host info has already been cached
+    if (options.enableRedirect.equalsIgnoreCase(RedirectionOption.ON.toString())
+        || options.enableRedirect.equalsIgnoreCase(RedirectionOption.PREFERRED.toString())) {
+
+      RedirectionInfo redirectInfo = redirectionInfoCache.getRedirectionInfo(username, currentHost);
+      if (redirectInfo != null) {
+        redirectHost = redirectInfo.getHost();
+        redirectUser = redirectInfo.getUser();
+        isUsingRedirectInfo = true;
+        try {
+          createConnectionImp(redirectHost, redirectUser);
+          return; // if connect successfully with cached redirect info, return from this function,
+          // otherwise go normal connect routine
+        } catch (SQLException exception) {
+          isUsingRedirectInfo = false;
+          redirectionInfoCache.removeRedirectionInfo(username, currentHost);
+          redirectHost = null;
+          redirectUser = null;
+        }
+      }
+    }
+
+    // Use user provided connection info to connect
+    createConnectionImp(hostAddress, username);
+  }
+
+  private void createConnectionImp(HostAddress hostAddress, String username) throws SQLException {
+    try {
+      handleConnectionPhases(hostAddress, username);
+
+      // When enableRedirect=on, the logic enforce the connection must go with redirection, so close
+      // conn if redirect not available
+      if (options.enableRedirect.equalsIgnoreCase(RedirectionOption.ON.toString())
+          && !isServerSupportRedirection()) {
+
+        closeSocket(this.reader, this.writer, this.socket);
+        throw new SQLException(RedirectionErrorMessage.RedirectNotAvailable);
+
+      } else if (!isUsingRedirectInfo && isRedirectionAvailable()) {
+
+        PacketInputStream originalReader = this.reader;
+        PacketOutputStream originalWriter = this.writer;
+        Socket originalSocket = this.socket;
+
+        try {
+          isUsingRedirectInfo = true;
+          handleConnectionPhases(redirectHost, redirectUser);
+          redirectionInfoCache.putRedirectionInfo(
+              username, currentHost, redirectHost, redirectUser, redirectTTL);
+
+          // close the original connection
+          closeSocket(originalReader, originalWriter, originalSocket);
+
+        } catch (SQLException redirectException) {
+          isUsingRedirectInfo = false;
+
+          if (options.enableRedirect.equalsIgnoreCase(RedirectionOption.PREFERRED.toString())) {
+            // Destroy redirect socket and use original connection
+            destroySocket();
+            this.reader = originalReader;
+            this.writer = originalWriter;
+            this.socket = originalSocket;
+
+          } else if (options.enableRedirect.equalsIgnoreCase(RedirectionOption.ON.toString())) {
+            // When enableRedirect=on, the logic enforce the connection must go with redirection, so
+            // close the original connection and throw redirect conn's exception
+            closeSocket(originalReader, originalWriter, originalSocket);
+            destroySocket(); // Destroy redirect socket
+            throw redirectException;
+          }
+        }
+      }
+
+      compressionHandler(options);
+    } catch (SQLException ioException) {
+      destroySocket();
+      throw ioException;
+    }
+
+    connected = true;
+
+    this.reader.setServerThreadId(this.serverThreadId, isMasterConnection());
+    this.writer.setServerThreadId(this.serverThreadId, isMasterConnection());
+
+    if (this.options.socketTimeout != null) {
+      this.socketTimeout = this.options.socketTimeout;
+    }
+    if ((serverCapabilities & MariaDbServerCapabilities.CLIENT_DEPRECATE_EOF) != 0) {
+      eofDeprecated = true;
+    }
+
+    postConnectionQueries();
+
+    activeStreamingResult = null;
+    hostFailed = false;
+  }
+
+  private void handleConnectionPhases(HostAddress hostAddress, String user) throws SQLException {
+
     String host = hostAddress != null ? hostAddress.host : null;
     int port = hostAddress != null ? hostAddress.port : 3306;
 
     Credential credential;
     CredentialPlugin credentialPlugin = urlParser.getCredentialPlugin();
     if (credentialPlugin != null) {
-      credential = credentialPlugin.initialize(options, username, hostAddress).get();
+      credential = credentialPlugin.initialize(options, user, hostAddress).get();
     } else {
-      credential = new Credential(username, urlParser.getPassword());
+      credential = new Credential(user, urlParser.getPassword());
     }
 
     this.socket = createSocket(host, port, options);
@@ -559,8 +680,6 @@ public abstract class AbstractConnectProtocol implements Protocol {
           database,
           credential,
           host);
-
-      compressionHandler(options);
     } catch (IOException ioException) {
       destroySocket();
       if (host == null) {
@@ -579,28 +698,6 @@ public abstract class AbstractConnectProtocol implements Protocol {
       destroySocket();
       throw sqlException;
     }
-
-    connected = true;
-
-    this.reader.setServerThreadId(this.serverThreadId, isMasterConnection());
-    this.writer.setServerThreadId(this.serverThreadId, isMasterConnection());
-
-    if (this.options.socketTimeout != null) {
-      this.socketTimeout = this.options.socketTimeout;
-    }
-    if ((serverCapabilities & MariaDbServerCapabilities.CLIENT_DEPRECATE_EOF) != 0) {
-      eofDeprecated = true;
-    }
-
-    postConnectionQueries();
-
-    // validate galera state
-    if (isMasterConnection() && !galeraAllowedStates.isEmpty()) {
-      galeraStateValidation();
-    }
-
-    activeStreamingResult = null;
-    hostFailed = false;
   }
 
   /** Closing socket in case of Connection error after socket creation. */
@@ -781,10 +878,16 @@ public abstract class AbstractConnectProtocol implements Protocol {
           // OK_Packet -> Authenticated !
           // see https://mariadb.com/kb/en/library/ok_packet/
           // *************************************************************************************
-          buffer.skipByte(); // 0x00 OkPacket Header
-          buffer.skipLengthEncodedNumeric(); // affectedRows
-          buffer.skipLengthEncodedNumeric(); // insertId
-          serverStatus = buffer.readShort();
+          OkPacket ok = new OkPacket(buffer, clientCapabilities);
+          serverStatus = ok.getServerStatus();
+          String message = ok.getInfo();
+          RedirectionInfo redirectInfo = RedirectionInfo.parseRedirectionInfo(message);
+          if (redirectInfo != null) {
+            redirectHost = redirectInfo.getHost();
+            redirectUser = redirectInfo.getUser();
+            redirectTTL = redirectInfo.getTTL();
+          }
+
           break authentication_loop;
 
         default:
@@ -934,6 +1037,28 @@ public abstract class AbstractConnectProtocol implements Protocol {
       destroySocket();
       throw sqlException;
     }
+  }
+
+  /** Condition that redirection is available */
+  private boolean isRedirectionAvailable() {
+    return (options.enableRedirect.equalsIgnoreCase(RedirectionOption.ON.toString())
+            || options.enableRedirect.equalsIgnoreCase(RedirectionOption.PREFERRED.toString()))
+        && redirectHost != null
+        && redirectHost.host != ""
+        && redirectHost.port != -1
+        && redirectUser != null
+        && redirectUser != ""
+        && (redirectHost.host != currentHost.host
+            || redirectHost.port != currentHost.port
+            || redirectUser != username);
+  }
+
+  private boolean isServerSupportRedirection() {
+    return redirectHost != null
+        && redirectHost.host != ""
+        && redirectHost.port != -1
+        && redirectUser != null
+        && redirectUser != "";
   }
 
   /**

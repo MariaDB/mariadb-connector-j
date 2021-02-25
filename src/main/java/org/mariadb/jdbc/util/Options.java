@@ -27,6 +27,8 @@ import java.sql.DriverManager;
 import java.util.Objects;
 import java.util.Properties;
 
+import org.mariadb.jdbc.internal.util.constant.RedirectionOption;
+
 @SuppressWarnings("ConstantConditions")
 public class Options implements Cloneable {
 
@@ -100,6 +102,7 @@ public class Options implements Cloneable {
   public boolean enablePacketDebug;
   public boolean useBulkStmts;
   public boolean disableSslHostnameVerification;
+  public String enableRedirect = RedirectionOption.OFF.toString().toLowerCase();
   public boolean autocommit = true;
   public boolean includeInnodbStatusInDeadlockExceptions;
   public boolean includeThreadDumpInDeadlockExceptions;
@@ -281,6 +284,11 @@ public class Options implements Cloneable {
     if (disableSslHostnameVerification != opt.disableSslHostnameVerification) {
       return false;
     }
+
+    if (!Objects.equals(enableRedirect, opt.enableRedirect)) {
+        return false;
+    }
+
     if (log != opt.log) {
       return false;
     }
@@ -522,6 +530,7 @@ public class Options implements Cloneable {
     result = 31 * result + (useBulkStmts ? 1 : 0);
     result = 31 * result + defaultFetchSize;
     result = 31 * result + (disableSslHostnameVerification ? 1 : 0);
+    result = 31 * result + (enableRedirect == null ? enableRedirect.hashCode() : 0);
     result = 31 * result + (log ? 1 : 0);
     result = 31 * result + (profileSql ? 1 : 0);
     result = 31 * result + maxQuerySizeToLog;

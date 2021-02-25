@@ -60,6 +60,7 @@ import java.util.Properties;
 import org.junit.Test;
 import org.mariadb.jdbc.internal.util.constant.HaMode;
 import org.mariadb.jdbc.internal.util.constant.ParameterConstant;
+import org.mariadb.jdbc.internal.util.constant.RedirectionOption;
 import org.mariadb.jdbc.util.Options;
 
 @SuppressWarnings("ConstantConditions")
@@ -656,5 +657,26 @@ public class JdbcParserTest {
     String url = "jdbc:mariadb://1.2.3.4/testj?user=john&slowQueryThresholdNanos=" + Long.MAX_VALUE;
     UrlParser jdbc = UrlParser.parse(url);
     assertEquals(Long.MAX_VALUE, jdbc.getOptions().slowQueryThresholdNanos.longValue());
+  }
+
+  /**
+   * MDEV-15935 : Connection Redirection Mechanism in MariaDB Client/Server Protocol
+   *
+   * @throws SQLException if any exception occur
+   */
+  @Test
+  public void checkEnableRedirectValue() throws SQLException {
+      UrlParser jdbc = UrlParser.parse("jdbc:mysql://hostName:3306?enableRedirect=on");
+      assertEquals(jdbc.getOptions().enableRedirect, RedirectionOption.ON.toString().toLowerCase());
+
+      UrlParser jdbc2 = UrlParser.parse("jdbc:mysql://hostName:3306?enableRedirect=off");
+      assertEquals(jdbc2.getOptions().enableRedirect, RedirectionOption.OFF.toString().toLowerCase());
+
+      UrlParser jdbc3 = UrlParser.parse("jdbc:mysql://hostName:3306?enableRedirect=preferred");
+      assertEquals(jdbc3.getOptions().enableRedirect, RedirectionOption.PREFERRED.toString().toLowerCase());
+
+      UrlParser jdbc4 = UrlParser.parse("jdbc:mysql://hostName:3306");
+      assertEquals(jdbc4.getOptions().enableRedirect, RedirectionOption.OFF.toString().toLowerCase());
+
   }
 }
