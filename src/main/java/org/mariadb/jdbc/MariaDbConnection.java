@@ -704,7 +704,7 @@ public class MariaDbConnection implements Connection {
 
     try (Statement stmt = createStatement()) {
       stateFlag |= ConnectionState.STATE_AUTOCOMMIT;
-      stmt.executeUpdate("set autocommit=" + ((autoCommit) ? "1" : "0"));
+      stmt.executeUpdate(autoCommit ? "set autocommit=1" : "set autocommit=0");
     }
   }
 
